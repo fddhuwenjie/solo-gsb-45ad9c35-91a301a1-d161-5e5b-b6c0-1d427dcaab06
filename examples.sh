@@ -16,6 +16,23 @@ post_merge() {
     -H 'Content-Type: application/json' -d "$1"
 }
 
+post_relocate() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/relocate" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
+post_redirect() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/redirects" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
+# 只打印 HTTP 状态码与 308 跳转目标（不跟随跳转）
+show_get() {
+  printf '  GET %s -> HTTP %s, location=%s\n' "$1" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE$1")" \
+    "$(curl -sS -o /dev/null -w '%{redirect_url}' "$BASE$1")"
+}
+
 echo "== 健康检查"
 curl -sS "$BASE/health"; echo
 
@@ -83,7 +100,62 @@ post_merge '{"base_revision":4,"changes":[
 echo "== 13) 既有接口不受影响：/publish 过期 expected_revision 仍为 409"
 post_publish '{"expected_revision":1,"changes":[]}'
 
+echo "== 站点读取：真实路径直接返回 HTML（HTTP 200）"
+show_get /index.html
+show_get /docs/index.html
+echo "  -- 未知路径返回 404"
+show_get /no/such/page.html
+
+echo "== 14) 登记旧地址跳转（不推进修订号）：/docs/old-guide.html -> /docs/index.html"
+post_redirect '{"old_path":"/docs/old-guide.html","target_path":"/docs/index.html"}'
+echo "  -- 跳转登记列表与当前修订号（修订号保持 5）"
+curl -sS "$BASE/redirects"; echo
+curl -sS "$BASE/revision"; echo
+echo "  -- 旧地址访问：308 永久跳转到真实路径"
+show_get /docs/old-guide.html
+
+echo "== 15) 跳转登记冲突（均为 422，跳转与修订号不变）"
+echo "  -- 旧地址是真实页面"
+post_redirect '{"old_path":"/docs/index.html","target_path":"/index.html"}'
+echo "  -- 旧地址已被其他跳转占用"
+post_redirect '{"old_path":"/docs/old-guide.html","target_path":"/index.html"}'
+echo "  -- 目标不是当前真实页面（指向另一条旧地址也在这一类，不形成跳转链）"
+post_redirect '{"old_path":"/docs/chain.html","target_path":"/docs/old-guide.html"}'
+echo "  -- 发布也不得占用旧地址（422，修订号不变）"
+post_publish '{"expected_revision":5,"changes":[
+  {"op":"upsert","path":"/docs/old-guide.html","content":"<p>占用旧地址应失败</p>"}
+]}'
+
+echo "== 16) 页面搬迁：/docs/index.html -> /manual/index.html（同一事务自动登记/改指跳转）"
+post_relocate '{"expected_revision":5,"old_path":"/docs/index.html","new_path":"/manual/index.html"}'
+echo "  -- 腾出的旧路径自动 308 到新路径；此前登记的跳转也改指新路径（无跳转链）"
+show_get /docs/index.html
+show_get /docs/old-guide.html
+show_get /manual/index.html
+curl -sS "$BASE/redirects"; echo
+echo "  -- 搬迁到已被跳转占用的路径必须失败（422，页面、跳转、修订号均不变）"
+post_relocate '{"expected_revision":6,"old_path":"/index.html","new_path":"/docs/index.html"}'
+
+echo "== 17) 撤销跳转后才能复用旧地址"
+echo "  -- 撤销前：发布到旧地址仍是 422"
+post_publish '{"expected_revision":6,"changes":[
+  {"op":"upsert","path":"/docs/index.html","content":"<p>still blocked</p>"}
+]}'
+curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/redirects/revoke" \
+  -H 'Content-Type: application/json' -d '{"old_path":"/docs/index.html"}'
+echo "  -- 撤销后 GET /docs/index.html 变为未知路径 404，修订号不变（仍为 6）"
+show_get /docs/index.html
+curl -sS "$BASE/revision"; echo
+echo "  -- 现在可把页面搬迁进该路径（旧地址复用成功）"
+post_relocate '{"expected_revision":6,"old_path":"/manual/index.html","new_path":"/docs/index.html"}'
+show_get /docs/index.html
+echo "  -- 撤销未登记的旧地址 -> 404"
+curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/redirects/revoke" \
+  -H 'Content-Type: application/json' -d '{"old_path":"/never/registered.html"}'
+
 echo "== 当前修订号与最终页面集合"
 curl -sS "$BASE/revision"; echo
 curl -sS "$BASE/pages"; echo
+echo "== 历史快照不受跳转影响：revision=1 仍是搬迁前的原快照"
+curl -sS "$BASE/pages?revision=1"; echo
 

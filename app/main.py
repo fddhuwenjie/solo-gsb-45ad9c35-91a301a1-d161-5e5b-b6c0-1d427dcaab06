@@ -6,13 +6,32 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import db
+from .errors import PublishConflict, PublishValidationError
 from .merge import MergeBaselineNotFound, MergeConflict, merge
-from .publish import PublishConflict, PublishValidationError, publish
+from .publish import publish
+from .redirects import (
+    RedirectNotFound,
+    load_redirects,
+    register_redirect,
+    redirect_target,
+    revoke_redirect,
+)
 from .relocate import relocate
+
+
+def _validate_site_path(v: str) -> str:
+    """页面/跳转共用的路径格式：以 / 开头、非空、无查询串与片段。"""
+    if not v.startswith("/"):
+        raise ValueError("path must start with '/'")
+    if len(v) < 2:
+        raise ValueError("path must not be empty")
+    if "#" in v or "?" in v:
+        raise ValueError("path must not contain query string or fragment")
+    return v
 
 
 class RelocateRequest(BaseModel):
@@ -25,13 +44,7 @@ class RelocateRequest(BaseModel):
     @field_validator("old_path", "new_path")
     @classmethod
     def _validate_relocate_path(cls, v: str) -> str:
-        if not v.startswith("/"):
-            raise ValueError("path must start with '/'")
-        if len(v) < 2:
-            raise ValueError("path must not be empty")
-        if "#" in v or "?" in v:
-            raise ValueError("path must not contain query string or fragment")
-        return v
+        return _validate_site_path(v)
 
 
 class Change(BaseModel):
@@ -46,13 +59,7 @@ class Change(BaseModel):
     @field_validator("path")
     @classmethod
     def _validate_path(cls, v: str) -> str:
-        if not v.startswith("/"):
-            raise ValueError("path must start with '/'")
-        if len(v) < 2:
-            raise ValueError("path must not be empty")
-        if "#" in v or "?" in v:
-            raise ValueError("path must not contain query string or fragment")
-        return v
+        return _validate_site_path(v)
 
     @field_validator("content")
     @classmethod
@@ -73,6 +80,29 @@ class MergeRequest(BaseModel):
 
     base_revision: int = Field(ge=0, description="本端改动所基于的历史修订号（0 为空基线）")
     changes: list[Change] = Field(default_factory=list)
+
+
+class RedirectRequest(BaseModel):
+    """旧地址跳转登记：旧地址沿用页面路径格式，目标必须是当前真实页面。"""
+
+    old_path: str = Field(description="旧地址，必须以 / 开头，且不是真实页面/其他跳转")
+    target_path: str = Field(description="跳转目标，必须是当前真实页面路径，以 / 开头")
+
+    @field_validator("old_path", "target_path")
+    @classmethod
+    def _validate_redirect_path(cls, v: str) -> str:
+        return _validate_site_path(v)
+
+
+class RedirectRevokeRequest(BaseModel):
+    """撤销旧地址跳转：撤销后该旧地址才能被重新登记或作为页面路径复用。"""
+
+    old_path: str = Field(description="要撤销跳转的旧地址，必须以 / 开头")
+
+    @field_validator("old_path")
+    @classmethod
+    def _validate_redirect_path(cls, v: str) -> str:
+        return _validate_site_path(v)
 
 
 @asynccontextmanager
@@ -224,6 +254,91 @@ def relocate_endpoint(req: RelocateRequest):
         return JSONResponse(
             status_code=422,
             content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.get("/redirects")
+def list_redirects():
+    """列出当前全部旧地址跳转（登记/撤销不推进修订号，此处始终是当前状态）。"""
+    conn = db.connect()
+    try:
+        return {"redirects": [{"old_path": k, "target_path": v} for k, v in load_redirects(conn).items()]}
+    finally:
+        conn.close()
+
+
+@app.post("/redirects")
+def register_redirect_endpoint(req: RedirectRequest):
+    """登记旧地址 -> 当前真实页面的 308 跳转。不推进页面修订号。"""
+    conn = db.connect()
+    try:
+        result = register_redirect(conn, old_path=req.old_path, target_path=req.target_path)
+        return {"registered": True, **result}
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+def _revoke(old_path: str):
+    """撤销跳转的共用实现：未登记返回 404，成功不推进修订号。"""
+    conn = db.connect()
+    try:
+        return revoke_redirect(conn, old_path=old_path)
+    except RedirectNotFound as exc:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "redirect not found", "old_path": exc.old_path},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/redirects/revoke")
+def revoke_redirect_endpoint(req: RedirectRevokeRequest):
+    """撤销旧地址跳转（POST JSON 形式），撤销后旧地址才可复用。不推进修订号。"""
+    return _revoke(req.old_path)
+
+
+@app.delete("/redirects/{old_path:path}")
+def delete_redirect_endpoint(old_path: str):
+    """撤销旧地址跳转（REST 形式 DELETE /redirects/<旧地址>）。"""
+    return _revoke("/" + old_path)
+
+
+# 站点读取：真实路径返回 HTML；已登记旧地址 308 跳到真实路径；其余 404。
+# 必须在所有 API 路由之后声明（catch-all），仅匹配 GET/HEAD，不影响 /docs 等。
+@app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+def site_reader(full_path: str):
+    path = "/" + full_path
+
+    conn = db.connect()
+    try:
+        current = conn.execute(
+            "SELECT current_revision FROM meta WHERE id = 1"
+        ).fetchone()["current_revision"]
+
+        row = conn.execute(
+            "SELECT content FROM pages WHERE revision = ? AND path = ?",
+            (current, path),
+        ).fetchone()
+        if row is not None:
+            return HTMLResponse(row["content"])
+
+        target = redirect_target(conn, path)
+        if target is not None:
+            # 308 永久跳转：方法与请求体不变，旧地址在搬迁后仍可访问。
+            return RedirectResponse(url=target, status_code=308)
+
+        # 未知路径：不是真实页面，也没有跳转登记。
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "page not found", "path": path},
         )
     finally:
         conn.close()

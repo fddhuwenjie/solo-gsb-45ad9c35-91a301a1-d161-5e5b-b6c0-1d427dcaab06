@@ -18,14 +18,15 @@ from __future__ import annotations
 
 import sqlite3
 
+from .errors import PublishValidationError
 from .linkcheck import check_links
 from .publish import (
-    PublishValidationError,
     _load_current_pages,
     _write_new_revision,
     apply_changes,
     check_entry_page,
 )
+from .redirects import check_redirect_consistency, load_redirects
 
 
 class MergeBaselineNotFound(Exception):
@@ -124,9 +125,12 @@ def merge(
         #    其他人新增/修改但本批未涉及的页面原样保留。
         pages = apply_changes(current_pages, changes)
 
-        # 3) 沿用入口页规则与整包站内链接校验（兜底其他人并行改动
-        #    造成的失效链接，逐项列出来源与错误目标）。
+        # 3) 沿用入口页规则、跳转不变量与整包站内链接校验（兜底其他人并行
+        #    改动造成的旧地址占用/跳转目标删除/失效链接，逐项列出错误）。
         check_entry_page(pages, current_rev)
+        redirect_errors = check_redirect_consistency(pages, load_redirects(conn))
+        if redirect_errors:
+            raise PublishValidationError(redirect_errors)
         link_errors = check_links(pages)
         if link_errors:
             raise PublishValidationError(link_errors)

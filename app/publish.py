@@ -4,25 +4,20 @@ from __future__ import annotations
 
 import sqlite3
 
+from .errors import PublishConflict, PublishValidationError
 from .linkcheck import check_links
+from .redirects import check_redirect_consistency, load_redirects
 
 INDEX = "/index.html"
 
-
-class PublishConflict(Exception):
-    """客户端携带的 expected_revision 已过期。"""
-
-    def __init__(self, current_revision: int) -> None:
-        self.current_revision = current_revision
-        super().__init__(f"expected revision is stale; current revision is {current_revision}")
-
-
-class PublishValidationError(Exception):
-    """整批改动试用后校验不通过；内容与修订号保持不变。"""
-
-    def __init__(self, errors: list[dict[str, str]]) -> None:
-        self.errors = errors
-        super().__init__("publish validation failed")
+# 向后兼容：历史调用方从 app.publish 引入这两个异常。
+__all__ = [
+    "INDEX",
+    "PublishConflict",
+    "PublishValidationError",
+    "apply_changes",
+    "check_entry_page",
+]
 
 
 def _load_current_pages(conn: sqlite3.Connection, revision: int) -> dict[str, str]:
@@ -104,12 +99,17 @@ def publish(
         # 2) 入口页规则：首次发布必须包含 /index.html；此后不得删除入口。
         check_entry_page(pages, current)
 
-        # 3) 核对最终所有页面的站内 href（相对、绝对、#片段；查询参数不影响目标）。
+        # 3) 跳转不变量：不得占用旧地址，也不得删除仍被跳转指向的页面。
+        redirect_errors = check_redirect_consistency(pages, load_redirects(conn))
+        if redirect_errors:
+            raise PublishValidationError(redirect_errors)
+
+        # 4) 核对最终所有页面的站内 href（相对、绝对、#片段；查询参数不影响目标）。
         link_errors = check_links(pages)
         if link_errors:
             raise PublishValidationError(link_errors)
 
-        # 4) 全部通过：写入新修订快照并推进修订号（仍在同一事务内）。
+        # 5) 全部通过：写入新修订快照并推进修订号（仍在同一事务内）。
         new_revision = _write_new_revision(conn, current, pages)
         conn.commit()
         return new_revision

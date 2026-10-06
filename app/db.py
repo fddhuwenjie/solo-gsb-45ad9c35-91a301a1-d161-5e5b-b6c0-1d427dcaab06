@@ -5,6 +5,11 @@
 - pages：按修订号保存每个页面的完整快照。读接口永远只读取
   ``revision = 当前修订号`` 的那一批行，因此发布是原子的，
   重启进程后数据仍在（文件型 SQLite）。
+- redirects：旧地址 -> 当前真实页面路径的 308 跳转登记。跳转是
+  **当前状态**而非页面修订：登记/撤销不推进修订号，但与页面快照
+  一样持久化在库中，重启后仍然有效。``old_path`` 唯一（旧地址沿用
+  页面路径格式，且不与真实页面/其他跳转冲突）；``target_path``
+  必须始终指向真实页面（搬迁时在同一事务内同步改写，不形成跳转链）。
 """
 
 from __future__ import annotations
@@ -31,6 +36,12 @@ CREATE TABLE IF NOT EXISTS pages (
     content  TEXT    NOT NULL,
     PRIMARY KEY (revision, path)
 );
+
+CREATE TABLE IF NOT EXISTS redirects (
+    old_path    TEXT PRIMARY KEY,
+    target_path TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redirects_target ON redirects (target_path);
 """
 
 
