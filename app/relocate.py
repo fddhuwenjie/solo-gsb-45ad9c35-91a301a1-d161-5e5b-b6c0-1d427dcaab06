@@ -8,10 +8,13 @@
   纯片段（``#x``）/纯查询（``?x``）指向本页，无需改动；绝对 href 与位置无关，
   仅当其指向旧页本身（绝对自指）时改指新页。
 - 外部链接、非链接内容（正文文本、注释、其他标签的属性等）一律不改。
+- 旧地址联动（同一写事务内）：腾出的旧路径登记为跳转（旧地址 -> 新路径），
+  此前指向旧页的既有跳转一并改指新路径——跳转永远直达真实页面，不形成跳转链；
+  新路径不得是已占用的跳转路径。
 
 沿用 :mod:`app.linkcheck` 的既有解析规则，并在搬迁后的最终页面集合上再跑一次
-整包链接校验作为兜底：新路径冲突或任一链接无法维持指向时整体回滚，
-内容与修订号均不变。成功时在同一事务内生成新修订快照，历史修订仍可读取。
+整包链接校验与跳转守护作为兜底：新路径冲突或任一链接无法维持指向时整体回滚，
+页面、跳转与修订号均不变。成功时在同一事务内生成新修订快照，历史修订仍可读取。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from html.parser import HTMLParser
 
 from .linkcheck import check_links, is_external, resolve_target
 from .publish import INDEX, PublishConflict, PublishValidationError, _load_current_pages
+from .redirects import load_redirects, redirect_guard_errors
 
 # 仅匹配 <a> 开始标签内的 href 属性（前面必须是空白，避免命中 data-href 之类）。
 _HREF_ATTR_RE = re.compile(
@@ -204,12 +208,13 @@ def relocate(
     old_path: str,
     new_path: str,
 ) -> int:
-    """在单个写事务内完成页面搬迁、链接改写、整包校验与新修订提交。
+    """在单个写事务内完成页面搬迁、链接改写、跳转联动、整包校验与新修订提交。
 
-    成功返回新修订号。过期修订号抛 :class:`PublishConflict`；
-    新路径冲突（已占用，含新旧相同）、旧页不存在、旧页为入口页或搬迁后
-    链接无法维持指向时抛 :class:`PublishValidationError`，事务回滚，
-    已发布内容与修订号均不变。
+    成功返回新修订号，同时把腾出的旧路径登记为跳转、并把此前指向旧页的
+    既有跳转改指新路径（不形成跳转链）。过期修订号抛 :class:`PublishConflict`；
+    新路径冲突（已占用，含新旧相同、含已占用的跳转路径）、旧页不存在、旧页为
+    入口页或搬迁后链接无法维持指向时抛 :class:`PublishValidationError`，
+    事务回滚，页面、跳转与修订号均不变。
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -220,6 +225,7 @@ def relocate(
             raise PublishConflict(current)
 
         pages = _load_current_pages(conn, current)
+        redirects = load_redirects(conn)
 
         pre_errors: list[dict[str, str]] = []
         if old_path == INDEX:
@@ -233,6 +239,10 @@ def relocate(
         if new_path in pages:
             pre_errors.append(
                 {"source": "", "target": new_path, "reason": "new path already exists"}
+            )
+        if new_path in redirects:
+            pre_errors.append(
+                {"source": "", "target": new_path, "reason": "new path is occupied by a redirect"}
             )
         if pre_errors:
             raise PublishValidationError(pre_errors)
@@ -257,12 +267,25 @@ def relocate(
         if link_errors:
             raise PublishValidationError(link_errors)
 
-        # 4) 写入新修订快照并推进修订号（仍在同一事务内）。
+        # 4) 跳转联动（同一事务内）：腾出的旧路径登记为跳转；此前指向旧页的
+        #    既有跳转改指新路径，跳转永远直达真实页面，不形成跳转链。
+        new_redirects = {
+            path: (new_path if target == old_path else target)
+            for path, target in redirects.items()
+        }
+        new_redirects[old_path] = new_path
+        guard_errors = redirect_guard_errors(new_redirects, new_pages)
+        if guard_errors:  # 兜底：上述预检已保证不会发生
+            raise PublishValidationError(guard_errors)
+
+        # 5) 写入新修订快照、跳转联动并推进修订号（仍在同一事务内）。
         new_revision = current + 1
         conn.executemany(
             "INSERT INTO pages (revision, path, content) VALUES (?, ?, ?)",
             [(new_revision, path, content) for path, content in sorted(new_pages.items())],
         )
+        conn.execute("UPDATE redirects SET target = ? WHERE target = ?", (new_path, old_path))
+        conn.execute("INSERT INTO redirects (path, target) VALUES (?, ?)", (old_path, new_path))
         conn.execute("UPDATE meta SET current_revision = ? WHERE id = 1", (new_revision,))
         conn.commit()
         return new_revision

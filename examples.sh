@@ -16,6 +16,25 @@ post_merge() {
     -H 'Content-Type: application/json' -d "$1"
 }
 
+post_relocate() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/relocate" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
+post_redirect() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/redirects" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
+delete_redirect() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X DELETE "$BASE/redirects" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
+site_status() {
+  curl -sS -o /dev/null -w "  $1 -> HTTP %{http_code} Location: %{redirect_url}\n" "$BASE/site$1"
+}
+
 echo "== 健康检查"
 curl -sS "$BASE/health"; echo
 
@@ -82,6 +101,44 @@ post_merge '{"base_revision":4,"changes":[
 
 echo "== 13) 既有接口不受影响：/publish 过期 expected_revision 仍为 409"
 post_publish '{"expected_revision":1,"changes":[]}'
+
+echo "== 14) 页面搬迁：/docs/index.html -> /manual/index.html（预期 200，revision=6；腾出的旧地址在同一事务内自动登记为跳转）"
+post_relocate '{"expected_revision":5,"old_path":"/docs/index.html","new_path":"/manual/index.html"}'
+
+echo "== 15) 站点读取：真实路径返回 HTML，旧地址 308 指向真实路径，未知路径 404"
+site_status /manual/index.html
+site_status /docs/index.html
+site_status /unknown.html
+
+echo "== 16) 登记跳转：/legacy/home.html -> /index.html（不推进修订号；随后旧地址 308 可用）"
+post_redirect '{"path":"/legacy/home.html","target":"/index.html"}'
+curl -sS "$BASE/revision"; echo
+site_status /legacy/home.html
+
+echo "== 17) 冲突：发布占用旧地址（跳转路径）-> 422，页面、跳转与修订号均不变"
+post_publish '{"expected_revision":6,"changes":[{"op":"upsert","path":"/docs/index.html","content":"<p>占用旧地址</p>"}]}'
+
+echo "== 18) 冲突：删除仍被跳转指向的页面 -> 422（同批先清掉 index 的链接，仅余跳转守护错误）"
+post_publish '{"expected_revision":6,"changes":[
+  {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1>"},
+  {"op":"delete","path":"/manual/index.html"}
+]}'
+
+echo "== 19) 冲突：搬迁到已占用的跳转路径 -> 422"
+post_relocate '{"expected_revision":6,"old_path":"/manual/index.html","new_path":"/docs/index.html"}'
+
+echo "== 20) 再次搬迁：/manual/index.html -> /guide/index.html（预期 200，revision=7；既有跳转改指新路径，不形成跳转链）"
+post_relocate '{"expected_revision":6,"old_path":"/manual/index.html","new_path":"/guide/index.html"}'
+curl -sS "$BASE/redirects"; echo
+site_status /docs/index.html
+site_status /manual/index.html
+
+echo "== 21) 撤销跳转后才能复用旧地址：撤销 /docs/index.html，再发布同名新页（预期 200，revision=8）"
+delete_redirect '{"path":"/docs/index.html"}'
+post_publish '{"expected_revision":7,"changes":[
+  {"op":"upsert","path":"/docs/index.html","content":"<a href=\"../index.html#top\">旧地址复用</a>"}
+]}'
+site_status /docs/index.html
 
 echo "== 当前修订号与最终页面集合"
 curl -sS "$BASE/revision"; echo

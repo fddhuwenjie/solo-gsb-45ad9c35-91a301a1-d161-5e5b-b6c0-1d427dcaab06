@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from .linkcheck import check_links
+from .redirects import load_redirects, redirect_guard_errors
 
 INDEX = "/index.html"
 
@@ -104,12 +105,14 @@ def publish(
         # 2) 入口页规则：首次发布必须包含 /index.html；此后不得删除入口。
         check_entry_page(pages, current)
 
-        # 3) 核对最终所有页面的站内 href（相对、绝对、#片段；查询参数不影响目标）。
-        link_errors = check_links(pages)
-        if link_errors:
-            raise PublishValidationError(link_errors)
+        # 3) 跳转守护：最终页面集合不得占用跳转（旧地址）路径，
+        #    也不得删除仍被跳转指向的页面。
+        # 4) 核对最终所有页面的站内 href（相对、绝对、#片段；查询参数不影响目标）。
+        errors = redirect_guard_errors(load_redirects(conn), pages) + check_links(pages)
+        if errors:
+            raise PublishValidationError(errors)
 
-        # 4) 全部通过：写入新修订快照并推进修订号（仍在同一事务内）。
+        # 5) 全部通过：写入新修订快照并推进修订号（仍在同一事务内）。
         new_revision = _write_new_revision(conn, current, pages)
         conn.commit()
         return new_revision

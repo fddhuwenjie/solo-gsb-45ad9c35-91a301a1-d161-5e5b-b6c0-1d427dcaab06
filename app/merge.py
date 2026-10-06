@@ -26,6 +26,7 @@ from .publish import (
     apply_changes,
     check_entry_page,
 )
+from .redirects import load_redirects, redirect_guard_errors
 
 
 class MergeBaselineNotFound(Exception):
@@ -124,12 +125,13 @@ def merge(
         #    其他人新增/修改但本批未涉及的页面原样保留。
         pages = apply_changes(current_pages, changes)
 
-        # 3) 沿用入口页规则与整包站内链接校验（兜底其他人并行改动
-        #    造成的失效链接，逐项列出来源与错误目标）。
+        # 3) 沿用入口页规则、跳转守护（不得占用跳转路径、不得删除仍被跳转
+        #    指向的页面）与整包站内链接校验（兜底其他人并行改动造成的失效
+        #    链接，逐项列出来源与错误目标）。
         check_entry_page(pages, current_rev)
-        link_errors = check_links(pages)
-        if link_errors:
-            raise PublishValidationError(link_errors)
+        errors = redirect_guard_errors(load_redirects(conn), pages) + check_links(pages)
+        if errors:
+            raise PublishValidationError(errors)
 
         # 4) 全部通过：生成一个新修订完整快照；历史快照保留可读取。
         new_revision = _write_new_revision(conn, current_rev, pages)

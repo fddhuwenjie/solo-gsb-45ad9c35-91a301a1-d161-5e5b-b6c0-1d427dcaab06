@@ -6,13 +6,25 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import db
 from .merge import MergeBaselineNotFound, MergeConflict, merge
-from .publish import PublishConflict, PublishValidationError, publish
+from .publish import INDEX, PublishConflict, PublishValidationError, publish
+from .redirects import RedirectValidationError, register_redirect, revoke_redirect
 from .relocate import relocate
+
+
+def _validate_page_path_format(v: str) -> str:
+    """页面路径格式：`/` 开头、非空、不含查询串与片段。"""
+    if not v.startswith("/"):
+        raise ValueError("path must start with '/'")
+    if len(v) < 2:
+        raise ValueError("path must not be empty")
+    if "#" in v or "?" in v:
+        raise ValueError("path must not contain query string or fragment")
+    return v
 
 
 class RelocateRequest(BaseModel):
@@ -73,6 +85,29 @@ class MergeRequest(BaseModel):
 
     base_revision: int = Field(ge=0, description="本端改动所基于的历史修订号（0 为空基线）")
     changes: list[Change] = Field(default_factory=list)
+
+
+class RedirectRegisterRequest(BaseModel):
+    """登记旧地址跳转：旧地址沿用页面路径格式，目标须是当前真实页面。"""
+
+    path: str = Field(description="旧地址（跳转路径），必须以 / 开头，且未被真实页面或其他跳转占用")
+    target: str = Field(description="跳转目标，必须是当前真实页面路径")
+
+    @field_validator("path", "target")
+    @classmethod
+    def _validate_redirect_path(cls, v: str) -> str:
+        return _validate_page_path_format(v)
+
+
+class RedirectRevokeRequest(BaseModel):
+    """撤销旧地址跳转：撤销之后旧地址才可被发布/合入复用。"""
+
+    path: str = Field(description="要撤销的旧地址（跳转路径），必须以 / 开头")
+
+    @field_validator("path")
+    @classmethod
+    def _validate_revoke_path(cls, v: str) -> str:
+        return _validate_page_path_format(v)
 
 
 @asynccontextmanager
@@ -225,5 +260,88 @@ def relocate_endpoint(req: RelocateRequest):
             status_code=422,
             content={"detail": "validation failed", "errors": exc.errors},
         )
+    finally:
+        conn.close()
+
+
+@app.get("/redirects")
+def list_redirects():
+    """当前全部旧地址跳转（旧地址 -> 真实页面路径）。跳转是当前状态，不随修订号快照。"""
+    conn = db.connect()
+    try:
+        rows = conn.execute("SELECT path, target FROM redirects ORDER BY path").fetchall()
+        return {"redirects": {row["path"]: row["target"] for row in rows}}
+    finally:
+        conn.close()
+
+
+@app.post("/redirects")
+def register_redirect_endpoint(req: RedirectRegisterRequest):
+    """登记旧地址跳转。校验与写入在同一 SQLite 写事务内完成；不推进页面修订号。"""
+    conn = db.connect()
+    try:
+        register_redirect(conn, path=req.path, target=req.target)
+        revision = conn.execute(
+            "SELECT current_revision FROM meta WHERE id = 1"
+        ).fetchone()["current_revision"]
+        return {
+            "registered": True,
+            "path": req.path,
+            "target": req.target,
+            "revision": revision,
+        }
+    except RedirectValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.delete("/redirects")
+def revoke_redirect_endpoint(req: RedirectRevokeRequest):
+    """撤销旧地址跳转。不推进页面修订号；撤销后旧地址才可被复用。"""
+    conn = db.connect()
+    try:
+        if not revoke_redirect(conn, req.path):
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "redirect not found", "path": req.path},
+            )
+        revision = conn.execute(
+            "SELECT current_revision FROM meta WHERE id = 1"
+        ).fetchone()["current_revision"]
+        return {"revoked": True, "path": req.path, "revision": revision}
+    finally:
+        conn.close()
+
+
+@app.get("/site")
+@app.get("/site/{page_path:path}")
+def serve_site(page_path: str = ""):
+    """站点读取：真实路径返回 HTML；已登记旧地址 308 指向真实路径；未知路径 404。
+
+    ``/site`` 与 ``/site/`` 视为入口页 ``/index.html``；308 的 ``Location``
+    指向站点内真实页面的 URL（``/site`` 前缀 + 真实路径）。
+    """
+    site_path = "/" + page_path if page_path else INDEX
+    conn = db.connect()
+    try:
+        current = conn.execute(
+            "SELECT current_revision FROM meta WHERE id = 1"
+        ).fetchone()["current_revision"]
+        row = conn.execute(
+            "SELECT content FROM pages WHERE revision = ? AND path = ?",
+            (current, site_path),
+        ).fetchone()
+        if row is not None:
+            return HTMLResponse(content=row["content"])
+        row = conn.execute(
+            "SELECT target FROM redirects WHERE path = ?", (site_path,)
+        ).fetchone()
+        if row is not None:
+            return RedirectResponse(url="/site" + row["target"], status_code=308)
+        raise HTTPException(status_code=404, detail="page not found")
     finally:
         conn.close()

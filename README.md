@@ -56,6 +56,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
 | `POST /merge` | 基于历史基线的并行变更合入，请求体 `{"base_revision":n,"changes":[...]}` |
 | `POST /relocate` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"/a.html","new_path":"/b.html"}` |
+| `GET /redirects` | 当前全部旧地址跳转 `{"redirects":{旧地址:真实路径}}` |
+| `POST /redirects` | 登记跳转，请求体 `{"path":"/old.html","target":"/real.html"}`；不推进修订号 |
+| `DELETE /redirects` | 撤销跳转，请求体 `{"path":"/old.html"}`；不推进修订号 |
+| `GET /site/{路径}` | 站点读取：真实路径返回 HTML；旧地址 308 指向真实路径；未知路径 404 |
 
 ## 页面搬迁（`POST /relocate`）
 
@@ -70,6 +74,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 - 外部链接与非链接内容（正文文本、注释、其他标签及属性等）一律不改；
 - 沿用既有的 href 解析规则与整包链接校验作为兜底：**新路径冲突，或任一链接无法
   维持指向时，整次搬迁失败，内容与修订号均不变（422）**；
+- **旧地址联动（同一写事务内）**：腾出的旧路径自动登记为跳转（旧地址 -> 新路径），
+  此前指向旧页的既有跳转一并改指新路径——跳转永远直达真实页面，不形成跳转链；
+  新路径不得是已占用的跳转路径（`new path is occupied by a redirect`，422）；
 - 过期 `expected_revision` 按发布接口同样的冲突规则返回 `409`；
 - 成功返回 `{"revision":n,"relocated":true,"old_path":...,"new_path":...}`，
   历史修订快照仍可通过 `GET /pages?revision=N` 读取，原发布与读取接口不受影响。
@@ -97,6 +104,80 @@ curl -s -X POST http://localhost:8000/relocate \
   -d '{"expected_revision":1,"old_path":"/about.html","new_path":"/about2.html"}'
 ```
 
+## 旧地址跳转（登记 / 撤销 / 站点读取）
+
+外部保存的旧页面地址在搬迁后仍应可访问。服务维护一张**跳转表**
+（`旧地址 -> 当前真实页面路径`，存于 SQLite，**重启后仍有效**）：
+
+- **站点读取** `GET /site/{路径}`：
+  - 真实页面路径 → `200` 返回 HTML 正文（`/site` 与 `/site/` 视为 `/index.html`）；
+  - 已登记的旧地址 → `308 Permanent Redirect`，`Location` 指向站点内真实页面的
+    URL（`/site` 前缀 + 真实路径），跟随一次即可拿到页面；
+  - 未知路径 → `404`。
+- **登记** `POST /redirects`：旧地址沿用页面路径格式（`/` 开头、不含 `?`/`#`），
+  且**未被真实页面或其他跳转占用**；目标须是**当前真实页面**——因此跳转永不指向
+  跳转，不形成跳转链。冲突返回 `422` 并逐项说明（`path is an existing page` /
+  `path is already a registered redirect` / `target page not found`）。
+- **撤销** `DELETE /redirects`：删除跳转记录；不存在返回 `404`。
+  **撤销之后旧地址才可被发布/合入复用。**
+- **登记与撤销都不推进页面修订号**（响应附带当前修订号便于核对），只写跳转表。
+- **发布/合入守护**：`/publish` 与 `/merge` 的最终页面集合**不得占用跳转路径**
+  （`path is occupied by a redirect`），也**不得删除仍被跳转指向的页面**
+  （`page is still the target of a redirect`）；违反返回 `422`，
+  **页面、跳转与修订号均不变**。
+- **搬迁联动**：见上节——搬迁在同一写事务内登记旧路径跳转并改指既有跳转。
+- 站内 `href` 校验始终只针对真实页面：链接到旧地址（跳转路径）视为
+  `target page not found`。
+- 跳转表是当前状态，不随修订号快照：`GET /pages?revision=N` 仍返回原页面集合。
+
+```bash
+# 登记跳转（不推进修订号）：旧地址 -> 当前真实页面
+curl -s -X POST http://localhost:8000/redirects \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/legacy/home.html","target":"/index.html"}'
+# {"registered":true,"path":"/legacy/home.html","target":"/index.html","revision":6}
+
+# 访问：真实路径返回 HTML；旧地址 308 指向真实路径；未知路径 404
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/site/index.html        # 200
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+  http://localhost:8000/site/legacy/home.html
+# 308 http://localhost:8000/site/index.html
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/site/unknown.html      # 404
+
+# 冲突：发布/合入占用旧地址（跳转路径）-> 422，页面、跳转与修订号均不变
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":6,"changes":[{"op":"upsert","path":"/legacy/home.html","content":"<p>x</p>"}]}'
+# {"detail":"validation failed","errors":[{"source":"","target":"/legacy/home.html",
+#   "reason":"path is occupied by a redirect"}]}
+
+# 冲突：删除仍被跳转指向的页面 -> 422（同批先清掉引用，仅余跳转守护错误）
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":6,"changes":[
+        {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1>"},
+        {"op":"delete","path":"/manual/index.html"}]}'
+# {"detail":"validation failed","errors":[{"source":"/docs/index.html",
+#   "target":"/manual/index.html","reason":"page is still the target of a redirect"}]}
+
+# 冲突：搬迁到已占用的跳转路径 -> 422
+curl -s -X POST http://localhost:8000/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":6,"old_path":"/manual/index.html","new_path":"/docs/index.html"}'
+# {"detail":"validation failed","errors":[{"source":"","target":"/docs/index.html",
+#   "reason":"new path is occupied by a redirect"}]}
+
+# 当前跳转表
+curl -s http://localhost:8000/redirects
+# {"redirects":{"/docs/index.html":"/guide/index.html","/legacy/home.html":"/index.html", ...}}
+
+# 撤销跳转（不推进修订号）；撤销后旧地址才可复用
+curl -s -X DELETE http://localhost:8000/redirects \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/legacy/home.html"}'
+# {"revoked":true,"path":"/legacy/home.html","revision":7}
+```
+
 ## 并行变更合入（`POST /merge`）
 
 同一文档包的不同客户端可能从**同一个旧修订分别改动**。`/merge` 接收**基线修订号**
@@ -112,7 +193,8 @@ curl -s -X POST http://localhost:8000/relocate \
 - 任一路径已变化即返回 **409**，响应给出当前修订号 `current` 与冲突路径列表
   `conflicts`（按路径排序），**整批不写入**，内容与修订号均不变。
 - 无同路径冲突时，**按提交顺序**把变更应用于**当前快照**：其他人新增或修改、
-  而本批未涉及的页面原样保留。随后沿用入口页规则与整包站内链接校验——
+  而本批未涉及的页面原样保留。随后沿用入口页规则、跳转守护（不得占用跳转路径、
+  不得删除仍被跳转指向的页面）与整包站内链接校验——
   若其他页面的并行改动使最终链接失效（例如别人删了某页、本端新页仍链接它），
   返回 **422**，逐项列出 `source`（来源页面）与 `target`（错误目标），
   内容及修订号同样不变。
@@ -219,17 +301,18 @@ curl -s "http://localhost:8000/pages?revision=1"
 
 ```
 app/
-  db.py         # SQLite 连接、建表、修订号元数据
+  db.py         # SQLite 连接、建表（meta/pages/redirects）、修订号元数据
   linkcheck.py  # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
-  publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
-  merge.py      # 单写事务：基线-当前路径比对 -> 并行合入 -> 整包校验 -> 新修订
-  relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、整包校验、新修订
-  main.py       # FastAPI 路由与请求模型（/publish、/merge 与 /relocate）
-tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入单测
+  publish.py    # 单写事务：试用整批改动 -> 跳转守护 + 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
+  merge.py      # 单写事务：基线-当前路径比对 -> 并行合入 -> 跳转守护 + 整包校验 -> 新修订
+  relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、旧地址跳转联动、整包校验、新修订
+  redirects.py  # 旧地址跳转：登记/撤销（不推进修订号）、发布/合入/搬迁共用的跳转守护
+  main.py       # FastAPI 路由与请求模型（/publish、/merge、/relocate、/redirects 与 /site 站点读取）
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入/旧地址跳转单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn
-examples.sh     # 可执行的 HTTP 调用示例
+examples.sh     # 可执行的 HTTP 调用示例（含旧地址跳转的访问、搬迁与冲突场景）
 ```
 
 ## 测试
